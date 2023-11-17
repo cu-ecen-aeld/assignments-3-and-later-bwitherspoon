@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 set +e
 
@@ -12,8 +12,8 @@ if ! [ -d "$1" ]; then
   exit 1
 fi
 
-numfiles=$(grep --recursive --only-matching --no-filename $2 $1 | wc -l)
-numlines=$(grep --recursive --files-with-matches $2 $1 | wc -l)
+numfiles=$(grep -roh $2 $1 | wc -l)
+numlines=$(grep -rl $2 $1 | wc -l)
 
 echo "The number of files are $numfiles and the number of matching lines are $numlines"
 
