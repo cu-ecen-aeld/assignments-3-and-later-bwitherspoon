@@ -34,7 +34,7 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     cd linux-stable
     echo "Checking out version ${KERNEL_VERSION}"
     git checkout ${KERNEL_VERSION}
-    git am ${FINDER_APP_DIR}/0001-scripts-dtc-Remove-redundant-YYLOC-global-declaratio.patch
+    git apply ${FINDER_APP_DIR}/0001-scripts-dtc-Remove-redundant-YYLOC-global-declaratio.patch
 
     make -j ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE mrproper
     make ARCH=$ARCH defconfig
