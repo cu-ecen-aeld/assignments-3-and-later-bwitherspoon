@@ -17,9 +17,14 @@ void* threadfunc(void* thread_param)
     struct thread_data* thread_args = (struct thread_data *)thread_param;
     int ret;
 
-    usleep(1000 * thread_args->wait_to_obtain_ms);
+    ret = usleep(1000 * thread_args->wait_to_obtain_ms);
+    if (ret != 0) {
+        perror("usleep");
+        thread_args->thread_complete_success = false;
+        return thread_param;
+    }
 
-    ret = pthread_mutex_lock(&thread_args->mutex);
+    ret = pthread_mutex_lock(thread_args->mutex);
     if (ret != 0) {
         errno = ret;
         perror("pthread_mutex_lock");
@@ -27,9 +32,14 @@ void* threadfunc(void* thread_param)
         return thread_param;
     }
 
-    usleep(1000 * thread_args->wait_to_release_ms);
+    ret = usleep(1000 * thread_args->wait_to_release_ms);
+    if (ret != 0) {
+        perror("usleep");
+        thread_args->thread_complete_success = false;
+        return thread_param;
+    }
 
-    ret = pthread_mutex_unlock(&thread_args->mutex);
+    ret = pthread_mutex_unlock(thread_args->mutex);
     if (ret != 0) {
         errno = ret;
         perror("pthread_mutex_unlock");
@@ -62,14 +72,7 @@ bool start_thread_obtaining_mutex(pthread_t *thread, pthread_mutex_t *mutex, int
         return false;
     }
 
-    ret = pthread_mutex_init(&thread_args->mutex, NULL);
-    if (ret != 0) {
-        errno = ret;
-        perror("pthread_mutex_init");
-        free(thread_args);
-        return false;
-    }
-
+    thread_args->mutex = mutex;
     thread_args->wait_to_obtain_ms = wait_to_obtain_ms;
     thread_args->wait_to_release_ms = wait_to_release_ms;
 
