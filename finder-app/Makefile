@@ -1,7 +1,3 @@
-CC := gcc
-CC := $(CROSS_COMPILE)$(CC)
-
-CFLAGS = -g -Wall
 
 .PHONY: all
 all: writer
