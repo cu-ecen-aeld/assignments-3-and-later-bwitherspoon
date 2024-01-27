@@ -2,14 +2,18 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PATH "/var/tmp/aesdsocketdata"
@@ -17,19 +21,282 @@
 #define BACKLOG 5
 #define INITIAL_BUFFER_CAPACITY 8192
 
-static bool running = false;
+struct client_data {
+  char addr_str[INET6_ADDRSTRLEN];
+  int sock;
+  bool done;
+};
 
+struct client_entry {
+  pthread_t tid;
+  struct client_data *data;
+  SLIST_ENTRY(client_entry) entries;
+};
+
+static bool g_running = false;
+
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Timestamp thread
+static void timestamp_thread(union sigval unused) {
+  int fd;
+  time_t ts;
+  struct tm *tm;
+  char str[256];
+
+  ts = time(NULL);
+  tm = localtime(&ts);
+  if (tm == NULL) {
+    perror("localtime");
+    return;
+  }
+
+  // RFC 2822 compliant format: "%a, %d %b %Y %T %z"
+  const char *fmt = "timestamp: %a, %d %b %Y %T %z\n";
+  if (strftime(str, sizeof(str), fmt, tm) == 0) {
+    fprintf(stderr, "strftime");
+    return;
+  }
+
+  fd = open(PATH, O_RDWR | O_CREAT | O_APPEND, 0644);
+  if (fd == -1) {
+    perror("open");
+    return;
+  }
+
+  const int ret = pthread_mutex_lock(&g_mutex);
+  if (ret != 0) {
+    fprintf(stderr, "lock: %d", ret);
+    return;
+  }
+
+  if (lseek(fd, 0, SEEK_END) == -1) {
+    perror("lseek");
+    goto timestamp_error_unlock;
+  }
+
+  if (write(fd, str, strnlen(str, sizeof(str))) == -1) {
+    perror("write");
+  }
+
+timestamp_error_unlock:
+  pthread_mutex_unlock(&g_mutex);
+  close(fd);
+}
+
+// Start timestamp timer
+static int start_timer(timer_t *timer) {
+  struct sigevent evp;
+  struct itimerspec ts;
+  int ret;
+
+  evp.sigev_value.sival_ptr = timer;
+  evp.sigev_notify = SIGEV_THREAD;
+  evp.sigev_notify_function = timestamp_thread;
+  evp.sigev_notify_attributes = NULL;
+  ret = timer_create(CLOCK_MONOTONIC, &evp, timer);
+  if (ret != 0) {
+    ret = errno;
+    return ret;
+  }
+
+  ts.it_interval.tv_sec = 10;
+  ts.it_interval.tv_nsec = 0;
+  ts.it_value.tv_sec = 10;
+  ts.it_value.tv_nsec = 0;
+  ret = timer_settime(*timer, 0, &ts, NULL);
+  if (ret != 0) {
+    ret = errno;
+    timer_delete(*timer);
+    return ret;
+  }
+
+  return 0;
+}
+
+// Client thread
+static void *client_thread(void *thread_data) {
+  struct client_data *data = (struct client_data *)thread_data;
+  int fd;
+  char *buf;
+  size_t buf_index = 0;
+  size_t buf_capacity = INITIAL_BUFFER_CAPACITY;
+  ssize_t received;
+  intptr_t status = 0;
+
+  buf = malloc(buf_capacity);
+  if (buf == NULL) {
+    status = errno;
+    perror("malloc");
+    return (void *)status;
+  }
+
+  fd = open(PATH, O_RDWR | O_CREAT | O_APPEND, 0644);
+  if (fd == -1) {
+    status = errno;
+    perror("open");
+    free(buf);
+    return (void *)status;
+  }
+
+  for (bool delimiter = false; !delimiter;) {
+    received = recv(data->sock, &buf[buf_index], buf_capacity - buf_index, 0);
+    if (received == -1) {
+      if (errno != EINTR) {
+        perror("recv");
+      }
+      status = errno;
+      break;
+    }
+    if (received == 0) {
+      break;
+    }
+
+    const size_t buffer_end = buf_index + received;
+    for (size_t i = buf_index; i < buffer_end; i++) {
+      buf_index++;
+      // Any data after newline delimiter is discarded
+      if (buf[i] == '\n') {
+        delimiter = true;
+        break;
+      }
+    }
+
+    if (!delimiter) {
+      // Double buffer capacity when current capacity reached
+      if (buf_index == buf_capacity) {
+        buf = realloc(buf, 2 * buf_capacity);
+        if (buf == NULL) {
+          status = errno;
+          perror("realloc");
+          break;
+        }
+        buf_capacity *= 2;
+      }
+      // Continue receiving until delimiter
+      continue;
+    }
+
+    status = pthread_mutex_lock(&g_mutex);
+    if (status != 0) {
+      fprintf(stderr, "lock: %d", (int)status);
+      break;
+    }
+
+    // Append received line to end of file
+    if (lseek(fd, 0, SEEK_END) == -1) {
+      status = errno;
+      perror("lseek");
+      goto client_error_unlock;
+    }
+
+    if (write(fd, buf, buf_index) == -1) {
+      status = errno;
+      perror("write");
+      goto client_error_unlock;
+    }
+
+    buf_index = 0;
+
+    // Send entire file contents to client
+    if (lseek(fd, 0, SEEK_SET) == -1) {
+      status = errno;
+      perror("lseek");
+      goto client_error_unlock;
+    }
+
+    do {
+      received = read(fd, buf, buf_capacity);
+      if (received == -1) {
+        status = errno;
+        perror("read");
+        goto client_error_unlock;
+      }
+      if (send(data->sock, buf, received, 0) == -1) {
+        status = errno;
+        perror("send");
+        goto client_error_unlock;
+      }
+    } while (received != 0);
+
+    pthread_mutex_unlock(&g_mutex);
+    continue;
+
+  client_error_unlock:
+    pthread_mutex_unlock(&g_mutex);
+    break;
+  }
+
+  syslog(LOG_INFO, "Closing connection from %s", data->addr_str);
+  printf("Closing connection from %s\n", data->addr_str);
+
+  close(fd);
+
+  free(buf);
+
+  close(data->sock);
+
+  return (void *)status;
+}
+
+// Create server socket
+static int create_socket(void) {
+  int sock;
+  int status;
+  struct addrinfo *info;
+  struct addrinfo *info_list;
+
+  struct addrinfo hints = {0};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+
+  if ((status = getaddrinfo(NULL, PORT, &hints, &info_list)) != 0) {
+    fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(status));
+    return -EADDRNOTAVAIL;
+  }
+
+  for (info = info_list; info != NULL; info = info->ai_next) {
+    sock = socket(info->ai_family, info->ai_socktype, info->ai_protocol);
+    if (sock == -1) {
+      status = errno;
+      continue;
+    }
+
+    int option = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+
+    if (bind(sock, info->ai_addr, info->ai_addrlen) == 0) {
+      break;
+    }
+
+    status = errno;
+
+    close(sock);
+  }
+
+  freeaddrinfo(info_list);
+
+  if (info == NULL) {
+    return -status;
+  }
+
+  return sock;
+}
+
+// Call only async-signal-safe functions in signal handler
 static void signal_handler(int signo) {
   if (signo == SIGINT || signo == SIGTERM) {
-    printf("Caught signal, exiting\n");
-    syslog(LOG_INFO, "Caught signal, exiting");
-    running = false;
+    g_running = false;
+    const char *msg = "Caught signal, exiting\n";
+    write(STDOUT_FILENO, msg, strnlen(msg, 24));
   } else {
-    fprintf(stderr, "Unexpected signal\n");
+    const char *msg = "Unexpected signal\n";
+    write(STDERR_FILENO, msg, strnlen(msg, 19));
   }
 }
 
-static void *get_in_addr(struct sockaddr *sa) {
+static inline void *get_sin_addr(struct sockaddr *sa) {
   if (sa->sa_family == AF_INET) {
     return &(((struct sockaddr_in *)sa)->sin_addr);
   }
@@ -40,19 +307,13 @@ static void *get_in_addr(struct sockaddr *sa) {
 int main(int argc, char *argv[]) {
   int opt;
   bool daemon = false;
-  pid_t pid;
-  struct addrinfo *servinfo;
-  int servfd;
-  int peerfd;
-  int filefd;
+  int sock;
+  int peer_sock;
   struct sockaddr_storage peer_addr;
   socklen_t peer_addr_size;
-  char peer_addr_str[INET6_ADDRSTRLEN];
+  SLIST_HEAD(slist_head, client_entry) head = SLIST_HEAD_INITIALIZER(head);
+  timer_t timer;
   int status = 0;
-  char *buffer;
-  size_t buffer_index = 0;
-  size_t buffer_capacity = INITIAL_BUFFER_CAPACITY;
-  ssize_t count;
 
   while ((opt = getopt(argc, argv, "d")) != -1) {
     switch (opt) {
@@ -64,54 +325,17 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  openlog(NULL, 0, LOG_USER);
+  SLIST_INIT(&head);
 
-  servfd = socket(PF_INET, SOCK_STREAM, 0);
-  if (servfd == -1) {
-    perror("socket");
-    return -1;
-  }
-
-  struct addrinfo hints = {0};
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_flags = AI_PASSIVE;
-
-  if ((status = getaddrinfo(NULL, PORT, &hints, &servinfo)) != 0) {
-    fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(status));
-    return -1;
-  }
-
-  {
-    int option = 1;
-    struct addrinfo *ptr;
-    for (ptr = servinfo; ptr != NULL; ptr = ptr->ai_next) {
-      servfd = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
-      if (servfd == -1) {
-        continue;
-      }
-      setsockopt(servfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
-
-      if (bind(servfd, ptr->ai_addr, ptr->ai_addrlen) == 0) {
-        break;
-      }
-
-      close(servfd);
-    }
-
-    freeaddrinfo(servinfo);
-
-    if (ptr == NULL) {
-      fprintf(stderr, "Could not bind\n");
-      return -1;
-    }
-  }
-
+  // Traditional forking UNIX daemon
   if (daemon) {
-    pid = fork();
+    const pid_t pid = fork();
+
     if (pid != 0) {
       exit(0);
-    } else if (pid == -1){
+    }
+
+    if (pid == -1) {
       perror("fork");
       return -1;
     }
@@ -122,10 +346,11 @@ int main(int argc, char *argv[]) {
     }
 
     if (chdir("/") == -1) {
-      perror("setsid");
+      perror("chdir");
       return -1;
     }
 
+    // Close and redirect stdin, stderr, and stdlog
     for (int fd = 0; fd < 3; fd++) {
       close(fd);
     }
@@ -135,128 +360,154 @@ int main(int argc, char *argv[]) {
     dup(0);
   }
 
-  running = true;
+  openlog(NULL, 0, LOG_USER);
 
-  struct sigaction act = {0};
-  act.sa_handler = signal_handler;
-
-  if (sigaction(SIGINT, &act, NULL) == -1) {
-    perror("sigaction");
+  sock = create_socket();
+  if (sock < 0) {
+    fprintf(stderr, "Could not bind: %s\n", strerror(-sock));
     return -1;
   }
 
-  if (sigaction(SIGTERM, &act, NULL) == -1) {
-    perror("sigaction");
+  g_running = true;
+
+  {
+    struct sigaction act = {0};
+    act.sa_handler = signal_handler;
+
+    if (sigaction(SIGINT, &act, NULL) == -1) {
+      perror("sigaction");
+      return -1;
+    }
+
+    if (sigaction(SIGTERM, &act, NULL) == -1) {
+      perror("sigaction");
+      return -1;
+    }
+  }
+
+  status = start_timer(&timer);
+  if (status != 0) {
+    fprintf(stderr, "create_timer: %s\n", strerror(status));
+    // TODO Better cleanup
+    close(sock);
     return -1;
   }
 
-  status = listen(servfd, BACKLOG);
+  status = listen(sock, BACKLOG);
   if (status == -1) {
     perror("listen");
+    // TODO Better Cleanup
+    close(sock);
+    timer_delete(timer);
     return -1;
   }
 
-  buffer = malloc(buffer_capacity);
-  if (buffer == NULL) {
-    perror("malloc");
-    return -1;
-  }
-
-  while (running) {
+  while (g_running) {
     peer_addr_size = sizeof peer_addr;
-    peerfd = accept(servfd, (struct sockaddr *)&peer_addr, &peer_addr_size);
-    if (peerfd == -1) {
+    peer_sock = accept(sock, (struct sockaddr *)&peer_addr, &peer_addr_size);
+    if (peer_sock == -1) {
       if (errno != EINTR) {
         status = -1;
       }
       break;
     }
 
-    inet_ntop(peer_addr.ss_family, get_in_addr((struct sockaddr *)&peer_addr),
-              peer_addr_str, sizeof peer_addr_str);
-
-    syslog(LOG_INFO, "Accepted connection from %s", peer_addr_str);
-    printf("Accepted connection from %s\n", peer_addr_str);
-
-    filefd = open(PATH, O_RDWR | O_CREAT | O_APPEND, 0644);
-    if (filefd == -1) {
-      perror("open");
+    struct client_data *data = calloc(1, sizeof(struct client_data));
+    if (data == NULL) {
+      perror("calloc");
       status = -1;
       break;
     }
 
-    for (bool delimiter = false; !delimiter;) {
-      count =
-          recv(peerfd, &buffer[buffer_index], buffer_capacity - buffer_index, 0);
-      if (count == -1) {
-        if (errno != EINTR) {
-          perror("recv");
-        }
-        break;
+    inet_ntop(peer_addr.ss_family, get_sin_addr((struct sockaddr *)&peer_addr),
+              data->addr_str, sizeof data->addr_str);
+
+    syslog(LOG_INFO, "Accepted connection from %s", data->addr_str);
+    printf("Accepted connection from %s\n", data->addr_str);
+
+    data->sock = peer_sock;
+
+    struct client_entry *entry = NULL;
+
+    // Join any finished threads
+    SLIST_FOREACH(entry, &head, entries) {
+      if (entry->data == NULL) {
+        continue;
       }
-      if (count == 0) {
-        break;
+      if (!entry->data->done) {
+        continue;
       }
 
-      const size_t buffer_end =  buffer_index + count;
-      for (size_t i = buffer_index; i < buffer_end; i++) {
-        buffer_index++;
-        if (buffer[i] == '\n') {
-          delimiter = true;
-          break;
-        }
-      }
-
-      if (!delimiter) {
-        if (buffer_index == buffer_capacity) {
-          buffer = realloc(buffer, 2 * buffer_capacity);
-          if (buffer == NULL) {
-            perror("realloc");
-            break;
-          }
-          buffer_capacity = 2 * buffer_capacity;
-        }
+      const int rc = pthread_join(entry->tid, NULL);
+      if (rc != 0) {
+        fprintf(stderr, "join: %s", strerror(rc));
+        // FIXME Maybe fail fast here instead
+        entry->data->done = false;
       } else {
-        if (write(filefd, buffer, buffer_index) == -1) {
-          perror("write");
-          break;
-        }
-
-        buffer_index = 0;
-
-        if (lseek(filefd, 0, SEEK_SET) == -1) {
-          perror("lseek");
-          break;
-        }
-
-        do {
-          count = read(filefd, buffer, buffer_capacity);
-          if (count == -1) {
-            perror("read");
-            break;
-          }
-          if (send(peerfd, buffer, count, 0) == -1) {
-            perror("send");
-            break;
-          }
-        } while (count != 0);
+        free(entry->data);
+        entry->data = NULL;
       }
     }
 
-    buffer_index = 0;
+    // Try to find an empty entry
+    SLIST_FOREACH(entry, &head, entries) {
+      if (entry->data == NULL) {
+        break;
+      }
+    }
 
-    close(peerfd);
-    close(filefd);
+    // Insert if empty entry not found
+    if (entry == NULL) {
+      entry = calloc(1, sizeof(struct client_entry));
+      if (entry == NULL) {
+        perror("calloc");
+        free(data);
+        status = -1;
+        break;
+      }
+      SLIST_INSERT_HEAD(&head, entry, entries);
+    }
 
-    syslog(LOG_INFO, "Closed connection from %s", peer_addr_str);
-    printf("Closed connection from %s\n", peer_addr_str);
+    const int rc =
+        pthread_create(&entry->tid, NULL, client_thread, (void *)data);
+    if (rc != 0) {
+      fprintf(stderr, "create: %s", strerror(rc));
+      status = -1;
+      break;
+    }
+
+    entry->data = data;
   }
 
+  if (!g_running) {
+    syslog(LOG_INFO, "Caught signal, exiting");
+  } else {
+    g_running = false;
+  }
+
+  close(sock);
+
+  timer_delete(timer);
+
+  // File still exists until all descriptors are closed
   unlink(PATH);
 
-  close(servfd);
+  // Join threads
+  struct client_entry *entry;
+  SLIST_FOREACH(entry, &head, entries) {
+    if (entry->data == NULL) {
+      continue;
+    }
+    pthread_join(entry->tid, NULL);
+    free(entry->data);
+    entry->data = NULL;
+  }
 
-  free(buffer);
+  while (!SLIST_EMPTY(&head)) {
+    entry = SLIST_FIRST(&head);
+    SLIST_REMOVE_HEAD(&head, entries);
+    free(entry);
+  }
 
   return status;
 }
