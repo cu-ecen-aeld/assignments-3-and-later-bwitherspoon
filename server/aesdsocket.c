@@ -16,7 +16,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#define PATH "/var/tmp/aesdsocketdata"
+#ifdef USE_AESD_CHAR_DEVICE
+  #define PATH "/dev/aesdchar"
+#else
+  #define PATH "/var/tmp/aesdsocketdata"
+#endif
 #define PORT "9000"
 #define BACKLOG 5
 #define INITIAL_BUFFER_CAPACITY 8192
@@ -87,7 +91,6 @@ timestamp_error_unlock:
 // Start timestamp timer
 static int start_timer(timer_t *timer) {
   struct sigevent evp;
-  struct itimerspec ts;
   int ret;
 
   evp.sigev_value.sival_ptr = timer;
@@ -100,6 +103,8 @@ static int start_timer(timer_t *timer) {
     return ret;
   }
 
+#ifndef USE_AESD_CHAR_DEVICE
+  struct itimerspec ts;
   ts.it_interval.tv_sec = 10;
   ts.it_interval.tv_nsec = 0;
   ts.it_value.tv_sec = 10;
@@ -110,6 +115,7 @@ static int start_timer(timer_t *timer) {
     timer_delete(*timer);
     return ret;
   }
+#endif
 
   return 0;
 }
@@ -183,12 +189,14 @@ static void *client_thread(void *thread_data) {
       break;
     }
 
+#ifndef USE_AESD_CHAR_DEVICE
     // Append received line to end of file
     if (lseek(fd, 0, SEEK_END) == -1) {
       status = errno;
       perror("lseek");
       goto client_error_unlock;
     }
+#endif
 
     if (write(fd, buf, buf_index) == -1) {
       status = errno;
@@ -198,12 +206,14 @@ static void *client_thread(void *thread_data) {
 
     buf_index = 0;
 
+#ifndef USE_AESD_CHAR_DEVICE
     // Send entire file contents to client
     if (lseek(fd, 0, SEEK_SET) == -1) {
       status = errno;
       perror("lseek");
       goto client_error_unlock;
     }
+#endif
 
     do {
       received = read(fd, buf, buf_capacity);
@@ -490,7 +500,9 @@ int main(int argc, char *argv[]) {
   timer_delete(timer);
 
   // File still exists until all descriptors are closed
+#ifndef USE_AESD_CHAR_DEVICE
   unlink(PATH);
+#endif
 
   // Join threads
   struct client_entry *entry;

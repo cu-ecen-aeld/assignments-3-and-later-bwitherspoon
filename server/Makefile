@@ -4,6 +4,12 @@ CFLAGS ?= -g -Wall -Werror -pthread
 # Must be after source files on Ubuntu 20.04 and older (i.e. use LDLIBS not LDFLAGS)
 LDLIBS ?= -lrt
 
+USE_AESD_CHAR_DEVICE ?= 1
+
+ifeq ($(USE_AESD_CHAR_DEVICE),1)
+  CFLAGS += -DUSE_AESD_CHAR_DEVICE
+endif
+
 .PHONY: all
 all: $(TARGET)
 
