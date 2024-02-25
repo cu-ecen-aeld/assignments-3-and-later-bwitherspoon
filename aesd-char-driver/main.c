@@ -28,24 +28,24 @@ int aesd_minor = 0;
 MODULE_AUTHOR("Brett Witherspoon");
 MODULE_LICENSE("Dual BSD/GPL");
 
-struct aesd_dev aesd_device;
+static struct aesd_dev aesd_device;
 
-int aesd_open(struct inode *inode, struct file *filp)
+static int aesd_open(struct inode *inode, struct file *filp)
 {
 	PDEBUG("open");
 
 	return 0;
 }
 
-int aesd_release(struct inode *inode, struct file *filp)
+static int aesd_release(struct inode *inode, struct file *filp)
 {
 	PDEBUG("release");
 
 	return 0;
 }
 
-ssize_t aesd_read(struct file *filp, char __user *buff, size_t count,
-		  loff_t *offp)
+static ssize_t aesd_read(struct file *filp, char __user *buff, size_t count,
+			 loff_t *offp)
 {
 	struct aesd_buffer_entry *entry;
 	size_t entry_offset;
@@ -94,8 +94,8 @@ read_unlock:
 	return retval;
 }
 
-ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
-		   loff_t *f_pos)
+static ssize_t aesd_write(struct file *filp, const char __user *buf,
+			  size_t count, loff_t *f_pos)
 {
 	ssize_t retval = 0;
 	size_t index;
@@ -152,7 +152,7 @@ write_unlock:
 	return retval;
 }
 
-struct file_operations aesd_fops = {
+static struct file_operations aesd_fops = {
 	.owner = THIS_MODULE,
 	.read = aesd_read,
 	.write = aesd_write,
@@ -176,7 +176,7 @@ static int aesd_setup_cdev(struct aesd_dev *dev)
 	return err;
 }
 
-int aesd_init_module(void)
+static int aesd_init_module(void)
 {
 	dev_t dev = 0;
 	int result;
@@ -202,7 +202,7 @@ int aesd_init_module(void)
 	return result;
 }
 
-void aesd_cleanup_module(void)
+static void aesd_cleanup_module(void)
 {
 	uint8_t index;
 	struct aesd_buffer_entry *entry;
