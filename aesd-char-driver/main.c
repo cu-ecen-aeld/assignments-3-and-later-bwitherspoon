@@ -44,6 +44,47 @@ static int aesd_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+static size_t aesd_size(void)
+{
+	uint8_t index;
+	struct aesd_buffer_entry *entry;
+	size_t size = 0;
+
+	// Unused entries are expected to have zero size
+	AESD_CIRCULAR_BUFFER_FOREACH(entry, &aesd_device.buffer, index)
+	{
+		size += entry->size;
+	}
+
+	return size;
+}
+
+static loff_t aesd_llseek(struct file *file, loff_t offset, int whence)
+{
+	loff_t ret;
+	loff_t size;
+
+	PDEBUG("llseek with offset %lld and whence %d", offset, whence);
+
+	mutex_lock(&aesd_device.lock);
+
+	size = aesd_size();
+
+	switch (whence) {
+	case SEEK_SET:
+	case SEEK_CUR:
+	case SEEK_END:
+		ret = fixed_size_llseek(file, offset, whence, size);
+		break;
+	default:
+		ret = -EINVAL;
+	}
+
+	mutex_unlock(&aesd_device.lock);
+
+	return ret;
+}
+
 static ssize_t aesd_read(struct file *filp, char __user *buff, size_t count,
 			 loff_t *offp)
 {
@@ -152,8 +193,9 @@ write_unlock:
 	return retval;
 }
 
-static struct file_operations aesd_fops = {
+struct file_operations aesd_fops = {
 	.owner = THIS_MODULE,
+	.llseek = aesd_llseek,
 	.read = aesd_read,
 	.write = aesd_write,
 	.open = aesd_open,
