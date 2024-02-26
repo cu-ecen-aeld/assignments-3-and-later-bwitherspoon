@@ -16,10 +16,12 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "aesd_ioctl.h"
+
 #ifdef USE_AESD_CHAR_DEVICE
-  #define PATH "/dev/aesdchar"
+#define PATH "/dev/aesdchar"
 #else
-  #define PATH "/var/tmp/aesdsocketdata"
+#define PATH "/var/tmp/aesdsocketdata"
 #endif
 #define PORT "9000"
 #define BACKLOG 5
@@ -123,11 +125,13 @@ static int start_timer(timer_t *timer) {
 // Client thread
 static void *client_thread(void *thread_data) {
   struct client_data *data = (struct client_data *)thread_data;
+  int res;
   int fd;
   char *buf;
   size_t buf_index = 0;
   size_t buf_capacity = INITIAL_BUFFER_CAPACITY;
   ssize_t received;
+  struct aesd_seekto seekto;
   intptr_t status = 0;
 
   buf = malloc(buf_capacity);
@@ -196,8 +200,19 @@ static void *client_thread(void *thread_data) {
       perror("lseek");
       goto client_error_unlock;
     }
+#else
+    buf[buf_index] = '\0';
+    res = sscanf(buf, "AESDCHAR_IOCSEEKTO:%u,%u", &seekto.write_cmd,
+                 &seekto.write_cmd_offset);
+    if (res == 2) {
+      // printf("Command %u with offset %u\n", seekto.write_cmd, seekto.write_cmd_offset);
+      if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) != 0) {
+        status = errno;
+        perror("ioctl");
+        goto client_error_unlock;
+      }
+    } else
 #endif
-
     if (write(fd, buf, buf_index) == -1) {
       status = errno;
       perror("write");
