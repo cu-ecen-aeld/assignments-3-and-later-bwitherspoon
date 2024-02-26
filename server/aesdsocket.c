@@ -45,7 +45,6 @@ static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Timestamp thread
 static void timestamp_thread(union sigval unused) {
-  int fd;
   time_t ts;
   struct tm *tm;
   char str[256];
@@ -64,7 +63,8 @@ static void timestamp_thread(union sigval unused) {
     return;
   }
 
-  fd = open(PATH, O_RDWR | O_CREAT | O_APPEND, 0644);
+#ifndef USE_AESD_CHAR_DEVICE
+  const int fd = open(PATH, O_RDWR | O_CREAT | O_APPEND, 0644);
   if (fd == -1) {
     perror("open");
     return;
@@ -84,6 +84,7 @@ static void timestamp_thread(union sigval unused) {
   if (write(fd, str, strnlen(str, sizeof(str))) == -1) {
     perror("write");
   }
+#endif
 
 timestamp_error_unlock:
   pthread_mutex_unlock(&g_mutex);
