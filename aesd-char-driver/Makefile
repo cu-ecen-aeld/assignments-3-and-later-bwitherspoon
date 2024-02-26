@@ -3,7 +3,7 @@
 #DEBUG = y
 
 # Add your debugging flag (or not) to CFLAGS
-ifeq ($(DEBUG),y)
+ifneq ($(DEBUG),)
   DEBFLAGS = -O -g -DAESD_DEBUG # "-O" is needed to expand inlines
 else
   DEBFLAGS = -O2
