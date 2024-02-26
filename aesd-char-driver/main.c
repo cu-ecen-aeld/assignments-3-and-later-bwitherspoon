@@ -22,6 +22,8 @@
 #include <linux/uaccess.h>
 #include <linux/fs.h> // file_operations
 
+#include "aesd_ioctl.h"
+
 int aesd_major = 0; // use dynamic major
 int aesd_minor = 0;
 
@@ -193,11 +195,63 @@ write_unlock:
 	return retval;
 }
 
+static long aesd_unlocked_ioctl(struct file *file, unsigned int cmd,
+				unsigned long arg)
+{
+	unsigned long not_copied;
+	struct aesd_seekto seekto;
+	uint32_t count;
+	uint8_t index;
+	size_t offset;
+
+	switch (cmd) {
+	case AESDCHAR_IOCSEEKTO:
+		not_copied = copy_from_user(&seekto, (const void __user *)arg,
+					sizeof(seekto));
+		if (not_copied != 0) {
+			return -EFAULT;
+		}
+		break;
+	default:
+		return -ENOTTY;
+	}
+
+	// Empty buffer
+	if (!aesd_device.buffer.full && aesd_device.buffer.out_offs == aesd_device.buffer.in_offs) {
+		return -EINVAL;
+	}
+
+	offset = 0;
+	count = 0;
+	index = aesd_device.buffer.out_offs;
+	do {
+		if (count == seekto.write_cmd) {
+			break;
+		}
+		offset += aesd_device.buffer.entry[index].size;
+		count++;
+		index = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+	} while (index != aesd_device.buffer.in_offs);
+
+	if (count != seekto.write_cmd) {
+		return -EINVAL;
+	}
+
+	if (seekto.write_cmd_offset >= aesd_device.buffer.entry[index].size) {
+		return -EINVAL;
+	}
+
+	file->f_pos = offset + seekto.write_cmd_offset;
+
+	return 0;
+}
+
 struct file_operations aesd_fops = {
 	.owner = THIS_MODULE,
 	.llseek = aesd_llseek,
 	.read = aesd_read,
 	.write = aesd_write,
+	.unlocked_ioctl = aesd_unlocked_ioctl,
 	.open = aesd_open,
 	.release = aesd_release,
 };
